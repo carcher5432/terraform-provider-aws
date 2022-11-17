@@ -3,8 +3,11 @@ package ecs
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aws/aws-sdk-go/service/codedeploy"
 	"log"
 	"math"
 	"strings"
@@ -344,6 +347,57 @@ func ResourceService() *schema.Resource {
 				Type:     schema.TypeBool,
 				Optional: true,
 				Default:  false,
+			},
+			"code_deploy": {
+				Type:     schema.TypeList,
+				Optional: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"application_name": {
+							Type:     schema.TypeString,
+							Required: true,
+						},
+						"deployment_group_name": {
+							Type:     schema.TypeString,
+							Required: true,
+						},
+						"hooks": {
+							Type:     schema.TypeList,
+							Optional: true,
+							MaxItems: 1,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"before_install": {
+										Type:         schema.TypeString,
+										Optional:     true,
+										ValidateFunc: verify.ValidARN,
+									},
+									"after_install": {
+										Type:         schema.TypeString,
+										Optional:     true,
+										ValidateFunc: verify.ValidARN,
+									},
+									"after_allow_test_traffic": {
+										Type:         schema.TypeString,
+										Optional:     true,
+										ValidateFunc: verify.ValidARN,
+									},
+									"before_allow_traffic": {
+										Type:         schema.TypeString,
+										Optional:     true,
+										ValidateFunc: verify.ValidARN,
+									},
+									"after_allow_traffic": {
+										Type:         schema.TypeString,
+										Optional:     true,
+										ValidateFunc: verify.ValidARN,
+									},
+								},
+							},
+						},
+					},
+				},
 			},
 		},
 
@@ -941,8 +995,105 @@ func flattenServiceRegistries(srs []*ecs.ServiceRegistry) []map[string]interface
 	return results
 }
 
+func fixHookName(hook string) string {
+	splitHook := strings.Split(hook, "_")
+	for key, val := range splitHook {
+		splitHook[key] = strings.ToUpper(val[:1]) + val[1:]
+	}
+	return strings.Join(splitHook, "")
+}
+
+func statusWaitDeploymentComplete(cdpConn *codedeploy.CodeDeploy, deploymentId *string) resource.StateRefreshFunc {
+	return func() (interface{}, string, error) {
+		response, err := cdpConn.GetDeployment(&codedeploy.GetDeploymentInput{DeploymentId: deploymentId})
+		if err != nil {
+			return nil, "", err
+		}
+		status := ""
+		if *response.DeploymentInfo.Status == "Succeeded" {
+			status = "succeeded"
+		} else if v := *response.DeploymentInfo.Status; v == "Failed" || v == "Stopped" {
+			return "", "failed", fmt.Errorf("deployment %s", strings.ToLower(v))
+		} else if *response.DeploymentInfo.InstanceTerminationWaitTimeStarted {
+			status = "succeeded"
+		} else if deploymentOverview := response.DeploymentInfo.DeploymentOverview; int(aws.Int64Value(deploymentOverview.Failed)) > 3 {
+			return "", "failed", fmt.Errorf("replacement task set failed to start with %d tasks in failed state", *deploymentOverview.Failed)
+		} else {
+			status = "inProgress"
+		}
+		return "", status, nil
+	}
+}
+
+func waitDeploymentComplete(cdpConn *codedeploy.CodeDeploy, deploymentId *string, timeout time.Duration) error {
+
+	stateConf := resource.StateChangeConf{
+		Pending: []string{"inProgress"},
+		Target:  []string{"succeeded"},
+		Refresh: statusWaitDeploymentComplete(cdpConn, deploymentId),
+		Timeout: timeout,
+	}
+	_, err := stateConf.WaitForStateContext(context.Background())
+	return err
+}
+
+type capacityProviderStrategy struct {
+	Base             *int    `json:"Base"`
+	CapacityProvider *string `json:"CapacityProvider"`
+	Weight           *int    `json:"Weight"`
+}
+
+type awsVpcConfiguration struct {
+	Subnets        []*string `json:"Subnets"`
+	SecurityGroups []*string `json:"SecurityGroups"`
+	AssignPublicIp *string   `json:"AssignPublicIp"`
+}
+
+type networkConfiguration struct {
+	AwsVpcConfiguration *awsVpcConfiguration `json:"AwsvpcConfiguration"`
+}
+
+type loadBalancerInfo struct {
+	ContainerName *string `json:"ContainerName"`
+	ContainerPort *int    `json:"ContainerPort"`
+}
+
+type serviceProperties struct {
+	TaskDefinition           *string                     `json:"TaskDefinition"`
+	LoadBalancerInfo         *loadBalancerInfo           `json:"LoadBalancerInfo"`
+	PlatformVersion          *string                     `json:"PlatformVersion"`
+	NetworkConfiguration     *networkConfiguration       `json:"NetworkConfiguration"`
+	CapacityProviderStrategy []*capacityProviderStrategy `json:"CapacityProviderStrategy"`
+}
+
+type targetService struct {
+	Type       *string            `json:"Type"`
+	Properties *serviceProperties `json:"Properties"`
+}
+
+type appSpecYml struct {
+	Version   *string                      `json:"version"`
+	Resources *[1]map[string]targetService `json:"Resources"`
+	Hooks     *[]map[string]string         `json:"Hooks"`
+}
+
 func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*conns.AWSClient).ECSConn
+	cdpConn := meta.(*conns.AWSClient).DeployConn
+	useCodeDeploy := false
+	if v, ok := d.GetOk("deployment_controller"); ok && v == ecs.DeploymentControllerTypeCodeDeploy {
+		useCodeDeploy = true
+	}
+	doCodeDeployment := false
+	doEcsUpdate := false
+	loadBalancers := expandLoadBalancers(d.Get("load_balancer").(*schema.Set).List())
+	deploymentProperties := &serviceProperties{
+		TaskDefinition: d.Get("task_definition").(*string),
+		LoadBalancerInfo: &loadBalancerInfo{
+			ContainerName: loadBalancers[0].ContainerName,
+			ContainerPort: aws.Int(int(*loadBalancers[0].ContainerPort)),
+		},
+	}
 
 	if d.HasChangesExcept("tags", "tags_all") {
 		input := &ecs.UpdateServiceInput{
@@ -955,16 +1106,19 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 
 		if schedulingStrategy == ecs.SchedulingStrategyDaemon {
 			if d.HasChange("deployment_minimum_healthy_percent") {
+				doEcsUpdate = true
 				input.DeploymentConfiguration = &ecs.DeploymentConfiguration{
 					MinimumHealthyPercent: aws.Int64(int64(d.Get("deployment_minimum_healthy_percent").(int))),
 				}
 			}
 		} else if schedulingStrategy == ecs.SchedulingStrategyReplica {
 			if d.HasChange("desired_count") {
+				doEcsUpdate = true
 				input.DesiredCount = aws.Int64(int64(d.Get("desired_count").(int)))
 			}
 
 			if d.HasChanges("deployment_maximum_percent", "deployment_minimum_healthy_percent") {
+				doEcsUpdate = true
 				input.DeploymentConfiguration = &ecs.DeploymentConfiguration{
 					MaximumPercent:        aws.Int64(int64(d.Get("deployment_maximum_percent").(int))),
 					MinimumHealthyPercent: aws.Int64(int64(d.Get("deployment_minimum_healthy_percent").(int))),
@@ -973,6 +1127,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 		}
 
 		if d.HasChange("deployment_circuit_breaker") {
+			doEcsUpdate = true
 			if input.DeploymentConfiguration == nil {
 				input.DeploymentConfiguration = &ecs.DeploymentConfiguration{}
 			}
@@ -986,6 +1141,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 		}
 
 		if d.HasChange("ordered_placement_strategy") {
+			doEcsUpdate = true
 			// Reference: https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_UpdateService.html#ECS-UpdateService-request-placementStrategy
 			// To remove an existing placement strategy, specify an empty object.
 			input.PlacementStrategy = []*ecs.PlacementStrategy{}
@@ -1002,6 +1158,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 		}
 
 		if d.HasChange("placement_constraints") {
+			doEcsUpdate = true
 			// Reference: https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_UpdateService.html#ECS-UpdateService-request-placementConstraints
 			// To remove all existing placement constraints, specify an empty array.
 			input.PlacementConstraints = []*ecs.PlacementConstraint{}
@@ -1018,82 +1175,201 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 		}
 
 		if d.HasChange("platform_version") {
-			input.PlatformVersion = aws.String(d.Get("platform_version").(string))
+			// Use Code Deploy
+			if useCodeDeploy {
+				doCodeDeployment = true
+				deploymentProperties.PlatformVersion = d.Get("platform_version").(*string)
+			} else {
+				input.PlatformVersion = aws.String(d.Get("platform_version").(string))
+			}
 		}
 
 		if d.HasChange("health_check_grace_period_seconds") {
+			doEcsUpdate = true
 			input.HealthCheckGracePeriodSeconds = aws.Int64(int64(d.Get("health_check_grace_period_seconds").(int)))
 		}
 
 		if d.HasChange("task_definition") {
-			input.TaskDefinition = aws.String(d.Get("task_definition").(string))
+			// Use Code Deploy
+			if useCodeDeploy {
+				doCodeDeployment = true
+			} else {
+				input.TaskDefinition = aws.String(d.Get("task_definition").(string))
+			}
 		}
 
 		if d.HasChange("network_configuration") {
-			input.NetworkConfiguration = expandNetworkConfiguration(d.Get("network_configuration").([]interface{}))
+			// Use Code Deploy
+			if useCodeDeploy {
+				doCodeDeployment = true
+				networkConfig := expandNetworkConfiguration(d.Get("network_configuration").([]interface{}))
+				deploymentProperties.NetworkConfiguration = &networkConfiguration{
+					AwsVpcConfiguration: &awsVpcConfiguration{
+						networkConfig.AwsvpcConfiguration.Subnets,
+						networkConfig.AwsvpcConfiguration.SecurityGroups,
+						networkConfig.AwsvpcConfiguration.AssignPublicIp,
+					},
+				}
+			} else {
+				input.NetworkConfiguration = expandNetworkConfiguration(d.Get("network_configuration").([]interface{}))
+			}
 		}
 
 		if d.HasChange("capacity_provider_strategy") {
-			input.CapacityProviderStrategy = expandCapacityProviderStrategy(d.Get("capacity_provider_strategy").(*schema.Set))
+			// Use Code Deploy
+			if useCodeDeploy {
+				doCodeDeployment = true
+				capacityProviders := expandCapacityProviderStrategy(d.Get("capacity_provider_strategy").(*schema.Set))
+				var capacityProviderList []*capacityProviderStrategy
+				for _, val := range capacityProviders {
+					capacityProviderList = append(capacityProviderList, &capacityProviderStrategy{
+						Base:             aws.Int(int(*val.Base)),
+						CapacityProvider: val.CapacityProvider,
+						Weight:           aws.Int(int(*val.Weight)),
+					})
+				}
+				deploymentProperties.CapacityProviderStrategy = capacityProviderList
+			} else {
+				input.CapacityProviderStrategy = expandCapacityProviderStrategy(d.Get("capacity_provider_strategy").(*schema.Set))
+			}
 		}
 
 		if d.HasChange("enable_execute_command") {
+			doEcsUpdate = true
 			input.EnableExecuteCommand = aws.Bool(d.Get("enable_execute_command").(bool))
 		}
 
 		if d.HasChange("enable_ecs_managed_tags") {
+			doEcsUpdate = true
 			input.EnableECSManagedTags = aws.Bool(d.Get("enable_ecs_managed_tags").(bool))
 		}
 
 		if d.HasChange("load_balancer") {
-			if v, ok := d.Get("load_balancer").(*schema.Set); ok && v != nil {
-				input.LoadBalancers = expandLoadBalancers(v.List())
+			// Use Code Deploy
+			if useCodeDeploy {
+				doCodeDeployment = true
+			} else {
+				if v, ok := d.Get("load_balancer").(*schema.Set); ok && v != nil {
+					input.LoadBalancers = expandLoadBalancers(v.List())
+				}
 			}
 		}
 
 		if d.HasChange("propagate_tags") {
+			doEcsUpdate = true
 			input.PropagateTags = aws.String(d.Get("propagate_tags").(string))
 		}
 
 		if d.HasChange("service_registries") {
+			doEcsUpdate = true
 			input.ServiceRegistries = expandServiceRegistries(d.Get("service_registries").([]interface{}))
 		}
 
-		log.Printf("[DEBUG] Updating ECS Service (%s): %s", d.Id(), input)
-		// Retry due to IAM eventual consistency
-		err := resource.Retry(propagationTimeout+serviceUpdateTimeout, func() *resource.RetryError {
-			_, err := conn.UpdateService(input)
+		if doEcsUpdate {
+			log.Printf("[DEBUG] Updating ECS Service (%s): %s", d.Id(), input)
+			// Retry due to IAM eventual consistency
+			err := resource.Retry(propagationTimeout+serviceUpdateTimeout, func() *resource.RetryError {
+				_, err := conn.UpdateService(input)
+
+				if err != nil {
+					if tfawserr.ErrMessageContains(err, ecs.ErrCodeInvalidParameterException, "verify that the ECS service role being passed has the proper permissions") {
+						return resource.RetryableError(err)
+					}
+
+					if tfawserr.ErrMessageContains(err, ecs.ErrCodeInvalidParameterException, "does not have an associated load balancer") {
+						return resource.RetryableError(err)
+					}
+
+					return resource.NonRetryableError(err)
+				}
+				return nil
+			})
+
+			if tfresource.TimedOut(err) {
+				_, err = conn.UpdateService(input)
+			}
 
 			if err != nil {
-				if tfawserr.ErrMessageContains(err, ecs.ErrCodeInvalidParameterException, "verify that the ECS service role being passed has the proper permissions") {
-					return resource.RetryableError(err)
-				}
-
-				if tfawserr.ErrMessageContains(err, ecs.ErrCodeInvalidParameterException, "does not have an associated load balancer") {
-					return resource.RetryableError(err)
-				}
-
-				return resource.NonRetryableError(err)
+				return fmt.Errorf("error updating ECS Service (%s): %w", d.Id(), err)
 			}
-			return nil
-		})
 
-		if tfresource.TimedOut(err) {
-			_, err = conn.UpdateService(input)
-		}
-
-		if err != nil {
-			return fmt.Errorf("error updating ECS Service (%s): %w", d.Id(), err)
-		}
-
-		cluster := d.Get("cluster").(string)
-		if d.Get("wait_for_steady_state").(bool) {
-			if _, err := waitServiceStable(conn, d.Id(), cluster, d.Timeout(schema.TimeoutUpdate)); err != nil {
-				return fmt.Errorf("error waiting for ECS service (%s) to reach steady state after update: %w", d.Id(), err)
+			cluster := d.Get("cluster").(string)
+			if d.Get("wait_for_steady_state").(bool) {
+				if _, err := waitServiceStable(conn, d.Id(), cluster, d.Timeout(schema.TimeoutUpdate)); err != nil {
+					return fmt.Errorf("error waiting for ECS service (%s) to reach steady state after update: %w", d.Id(), err)
+				}
+			} else {
+				if _, err := waitServiceActive(conn, d.Id(), cluster, d.Timeout(schema.TimeoutUpdate)); err != nil {
+					return fmt.Errorf("error waiting for ECS service (%s) to become active after update: %w", d.Id(), err)
+				}
 			}
-		} else {
-			if _, err := waitServiceActive(conn, d.Id(), cluster, d.Timeout(schema.TimeoutUpdate)); err != nil {
-				return fmt.Errorf("error waiting for ECS service (%s) to become active after update: %w", d.Id(), err)
+		}
+		if doCodeDeployment {
+
+			cdpBlockRaw, ok := d.GetOk("code_deploy")
+			if !ok {
+				return fmt.Errorf("need to do CodeDeploy Deployment, but no code_deploy block specified")
+			}
+			cdpBlock := cdpBlockRaw.(map[string]interface{})
+
+			var hooks []map[string]string
+			if hooksBlock, ok := cdpBlock["hooks"].(map[string]string); ok && len(hooksBlock) > 0 {
+				for key, val := range hooksBlock {
+					hooks = append(hooks, map[string]string{
+						fixHookName(key): val,
+					})
+				}
+			}
+
+			appSpec := appSpecYml{
+				Version: aws.String("0.0"),
+				Resources: &[1]map[string]targetService{
+					{
+						"TargetService": targetService{
+							Type:       aws.String("AWS::ECS::Service"),
+							Properties: deploymentProperties,
+						},
+					},
+				},
+			}
+			if len(hooks) > 0 {
+				appSpec.Hooks = &hooks
+			}
+			appSpecJson, err := json.Marshal(appSpec)
+			if err != nil {
+				return fmt.Errorf("error marshaling CodeDeploy AppSpec to json: %w Content: %#v", err, appSpec)
+			}
+
+			applicationName, ok := cdpBlock["application_name"].(string)
+			if !ok || applicationName == "" {
+				return fmt.Errorf("error with CodeDeploy application name in service %s: %s", d.Id(), applicationName)
+			}
+			deploymentGroupName, ok := cdpBlock["deployment_group_name"].(string)
+			if !ok || deploymentGroupName == "" {
+				return fmt.Errorf("error with CodeDeploy deployment group name in service %s: %s", d.Id(), deploymentGroupName)
+			}
+
+			deploymentInput := &codedeploy.CreateDeploymentInput{
+				ApplicationName:     &applicationName,
+				DeploymentGroupName: &deploymentGroupName,
+				Revision: &codedeploy.RevisionLocation{
+					RevisionType: aws.String(codedeploy.RevisionLocationTypeAppSpecContent),
+					AppSpecContent: &codedeploy.AppSpecContent{
+						Content: aws.String(string(appSpecJson)),
+						Sha256:  aws.String(fmt.Sprintf("%x", sha256.Sum256(appSpecJson))),
+					},
+				},
+			}
+
+			log.Printf("[DEBUG] Creating CodeDeploy Deployment for ECS Service (%s). Input: %s", d.Id(), deploymentInput)
+			response, err := cdpConn.CreateDeployment(deploymentInput)
+			if err != nil {
+				return fmt.Errorf("error creating CodeDeploy Deployment for ECS Service (%s): %w", d.Id(), err)
+			}
+			deploymentId := response.DeploymentId
+			log.Printf("[DEBUG] Deployment created for ECS Service (%s): %s", d.Id(), *deploymentId)
+			if err := waitDeploymentComplete(cdpConn, deploymentId, time.Minute*20); err != nil {
+				return fmt.Errorf("error waiting for deployment to finish for ECS Service (%s): %w", d.Id(), err)
 			}
 		}
 	}
