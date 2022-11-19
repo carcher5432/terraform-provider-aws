@@ -1017,7 +1017,11 @@ func statusWaitDeploymentComplete(cdpConn *codedeploy.CodeDeploy, deploymentId *
 		} else if *response.DeploymentInfo.InstanceTerminationWaitTimeStarted {
 			status = "succeeded"
 		} else if deploymentOverview := response.DeploymentInfo.DeploymentOverview; int(aws.Int64Value(deploymentOverview.Failed)) > 3 {
-			return "", "failed", fmt.Errorf("replacement task set failed to start with %d tasks in failed state", *deploymentOverview.Failed)
+			_, err := cdpConn.StopDeployment(&codedeploy.StopDeploymentInput{DeploymentId: deploymentId})
+			if err != nil {
+				return "", "failed", fmt.Errorf("replacement task set failed to start with %d tasks in failed state. Deployment could not be stopped: %w", *deploymentOverview.Failed, err)
+			}
+			return "", "failed", fmt.Errorf("replacement task set failed to start with %d tasks in failed state. Deployment has been stopped", *deploymentOverview.Failed)
 		} else {
 			status = "inProgress"
 		}
@@ -1180,6 +1184,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 				doCodeDeployment = true
 				deploymentProperties.PlatformVersion = d.Get("platform_version").(*string)
 			} else {
+				doEcsUpdate = true
 				input.PlatformVersion = aws.String(d.Get("platform_version").(string))
 			}
 		}
@@ -1194,6 +1199,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 			if useCodeDeploy {
 				doCodeDeployment = true
 			} else {
+				doEcsUpdate = true
 				input.TaskDefinition = aws.String(d.Get("task_definition").(string))
 			}
 		}
@@ -1211,6 +1217,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 					},
 				}
 			} else {
+				doEcsUpdate = true
 				input.NetworkConfiguration = expandNetworkConfiguration(d.Get("network_configuration").([]interface{}))
 			}
 		}
@@ -1230,6 +1237,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 				}
 				deploymentProperties.CapacityProviderStrategy = capacityProviderList
 			} else {
+				doEcsUpdate = true
 				input.CapacityProviderStrategy = expandCapacityProviderStrategy(d.Get("capacity_provider_strategy").(*schema.Set))
 			}
 		}
@@ -1250,6 +1258,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 				doCodeDeployment = true
 			} else {
 				if v, ok := d.Get("load_balancer").(*schema.Set); ok && v != nil {
+					doEcsUpdate = true
 					input.LoadBalancers = expandLoadBalancers(v.List())
 				}
 			}
