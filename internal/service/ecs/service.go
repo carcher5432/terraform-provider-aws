@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go/service/codedeploy"
 	"log"
 	"math"
 	"strings"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/arn"
+	"github.com/aws/aws-sdk-go/service/codedeploy"
 	"github.com/aws/aws-sdk-go/service/ecs"
 	"github.com/hashicorp/aws-sdk-go-base/v2/awsv1shim/v2/tfawserr"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
@@ -1010,9 +1010,9 @@ func statusWaitDeploymentComplete(cdpConn *codedeploy.CodeDeploy, deploymentId *
 			return nil, "", err
 		}
 		status := ""
-		if *response.DeploymentInfo.Status == "Succeeded" {
+		if aws.StringValue(response.DeploymentInfo.Status) == "Succeeded" {
 			status = "succeeded"
-		} else if v := *response.DeploymentInfo.Status; v == "Failed" || v == "Stopped" {
+		} else if v := aws.StringValue(response.DeploymentInfo.Status); v == "Failed" || v == "Stopped" {
 			return "", "failed", fmt.Errorf("deployment %s", strings.ToLower(v))
 		} else if *response.DeploymentInfo.InstanceTerminationWaitTimeStarted {
 			status = "succeeded"
@@ -1095,7 +1095,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 		TaskDefinition: d.Get("task_definition").(*string),
 		LoadBalancerInfo: &loadBalancerInfo{
 			ContainerName: loadBalancers[0].ContainerName,
-			ContainerPort: aws.Int(int(*loadBalancers[0].ContainerPort)),
+			ContainerPort: aws.Int(int(aws.Int64Value(loadBalancers[0].ContainerPort))),
 		},
 	}
 
@@ -1230,9 +1230,9 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 				var capacityProviderList []*capacityProviderStrategy
 				for _, val := range capacityProviders {
 					capacityProviderList = append(capacityProviderList, &capacityProviderStrategy{
-						Base:             aws.Int(int(*val.Base)),
+						Base:             aws.Int(int(aws.Int64Value(val.Base))),
 						CapacityProvider: val.CapacityProvider,
-						Weight:           aws.Int(int(*val.Weight)),
+						Weight:           aws.Int(int(aws.Int64Value(val.Weight))),
 					})
 				}
 				deploymentProperties.CapacityProviderStrategy = capacityProviderList
@@ -1377,7 +1377,7 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 			}
 			deploymentId := response.DeploymentId
 			log.Printf("[DEBUG] Deployment created for ECS Service (%s): %s", d.Id(), *deploymentId)
-			if err := waitDeploymentComplete(cdpConn, deploymentId, time.Minute*20); err != nil {
+			if err := waitDeploymentComplete(cdpConn, deploymentId, d.Timeout(schema.TimeoutUpdate)); err != nil {
 				return fmt.Errorf("error waiting for deployment to finish for ECS Service (%s): %w", d.Id(), err)
 			}
 		}
