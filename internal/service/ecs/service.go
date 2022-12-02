@@ -1091,7 +1091,8 @@ func resourceServiceUpdate(d *schema.ResourceData, meta interface{}) error {
 		}
 
 		if d.HasChange("service_connect_configuration") {
-			// TODO understand this
+			// There is nothing indicating that this can't be done by ecs.UpdateService or that it can be done by codedeploy.CreateDeployment
+			doEcsUpdate = true
 			input.ServiceConnectConfiguration = expandServiceConnectConfiguration(d.Get("service_connect_configuration").([]interface{}))
 		}
 
